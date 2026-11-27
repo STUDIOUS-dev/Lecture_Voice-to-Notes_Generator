@@ -1,0 +1,21 @@
+# One-click deploy on Render: https://render.com/deploy
+# (Dashboard → New → Blueprint → select this repository)
+services:
+  - type: web
+    name: intellilecture
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # you'll be prompted to paste your key
+      - key: AI_PROVIDER
+        value: api
+      - key: MAX_UPLOAD_MB
+        value: "100"
+      - key: UPLOADS_PER_HOUR
+        value: "10"
+      - key: MAX_CONCURRENT_JOBS
+        value: "2"

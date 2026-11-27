@@ -1,162 +1,180 @@
-# IntelliLecture -- AI-Powered Lecture Intelligence System
+# IntelliLecture — AI Lecture Voice-to-Notes Generator
 
-A web application that converts lecture audio files into comprehensive,
-structured study materials using state-of-the-art pretrained AI models.
-Built with a **FastAPI** backend and **React.js / Vite** frontend.
+Upload a lecture recording and get, in about a minute:
+
+- **Transcript** with timestamps and search
+- **Summary**: overview, key points and important concepts
+- **Topic breakdown** with jump-in timestamps and keywords
+- **Interactive quiz**: multiple-choice questions with answers & explanations, plus short-answer questions with model answers
+- **Flashcards** you can flip through
+- **Export** to PDF or Markdown (Notion / Obsidian friendly)
+
+Built with a **FastAPI** backend and a **React + Vite** frontend, deployable as a single Docker container.
 
 ---
 
-## Recent Updates
-
-- **Enhanced AI Outputs**: Improved the coherence and accuracy of AI-generated summaries (overview, key points, concepts) and assessments (quizzes and flashcards) to ensure high-quality educational materials.
-- **Project Structure Optimization**: Transitioned from the original Django monolith architecture to a more scalable separated backend (FastAPI) and frontend (React.js/Vite) stack.
-- **Pipeline Refinements**: Adjusted NLP cleaning and evaluation metrics processing for better general reliability.
-
----
-
-## Project Structure
+## How it works
 
 ```
-IntelliLecture/
-├── backend/
-│   ├── main.py              # FastAPI application and route handlers
-│   └── services/            # Modular AI services
-│       ├── asr.py           # Whisper Speech-to-Text
-│       ├── summarizer.py    # BART Summarization
-│       ├── nlp_utils.py     # KeyBERT + Topic Segmentation
-│       ├── quiz_gen.py      # Flan-T5 Quiz & Flashcards
-│       ├── evaluator.py     # WER & ROUGE Metrics
-│       └── pdf_export.py    # ReportLab PDF generation
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx          # Main React application component
-│   │   ├── App.css          # Component styles (EventPop theme)
-│   │   ├── index.css        # Global CSS variables and resets
-│   │   └── main.jsx         # React entry point
-│   ├── index.html           # HTML shell
-│   ├── vite.config.js       # Vite config with API proxy
-│   └── package.json
-├── data/                    # Auto-created: jobs JSON + uploaded audio
-├── ffmpeg.exe               # Bundled FFmpeg binary (Windows)
-└── requirements.txt         # Python dependencies
+Audio upload ─► Speech-to-text ─► Clean-up ─► Study-material generation ─► Metrics ─► Dashboard / PDF / Markdown
+                 (Whisper)                     (LLM or local models)       (ROUGE)
 ```
+
+The AI backend is **switchable** via the `AI_PROVIDER` setting:
+
+| Mode | Speech-to-text | Notes, quiz & flashcards | Speed (1-hr lecture) | Needs |
+|---|---|---|---|---|
+| **API** (recommended) | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | ~1–3 min | Free [Groq API key](https://console.groq.com/keys) |
+| **Local** | Whisper `base` | BART-large-CNN, KeyBERT, Flan-T5 | 10–25 min on CPU | ~4 GB RAM, `requirements-local.txt` |
+
+`AI_PROVIDER=auto` (default) uses the API when a key is set and falls back to local models otherwise.
+Any OpenAI-compatible API works (OpenAI, Together, a local Ollama, …) via `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`.
+
+Long lectures are handled map-reduce style: the transcript is split into timestamped chunks, each chunk is turned into topic sections, and a final pass produces the summary, quiz and flashcards. This keeps every request within free-tier limits, and rate-limit responses are retried automatically.
 
 ---
 
-## Setup Instructions
+## Quick start (local development)
 
-### 1. Prerequisites
-
-- Python 3.10+
-- Node.js 18+ and npm
-- **FFmpeg**: A `ffmpeg.exe` is bundled in the project root for Windows. On other platforms:
-  - **macOS**: `brew install ffmpeg`
-  - **Ubuntu/Debian**: `sudo apt install ffmpeg`
-
-### 2. Create & Activate Virtual Environment
+**Prerequisites:** Python 3.10+, Node.js 18+, and [FFmpeg](https://ffmpeg.org/download.html)
+(`brew install ffmpeg` / `sudo apt install ffmpeg` / on Windows, put `ffmpeg.exe` in the project root).
 
 ```bash
+# 1. Python environment
 python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# macOS / Linux
-source venv/bin/activate
-```
-
-### 3. Install Python Dependencies
-
-```bash
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
+# Optional, for offline local models:
+# pip install -r requirements-local.txt
 
-> This will download several GB of model weights on first run (Whisper, BART, Flan-T5, sentence-transformers).
-> Subsequent runs load from local cache and are much faster.
+# 2. Configuration
+cp .env.example .env              # then paste your GROQ_API_KEY into .env
 
-### 4. Start the Application
-
-Start both the FastAPI backend and the React frontend concurrently with a single command:
-
-```bash
+# 3. Run backend + frontend together (with the venv activated)
 cd frontend
 npm install
 npm run dev
 ```
 
-- The React application will be available at **http://127.0.0.1:5173**
-- The FastAPI backend will be running at **http://127.0.0.1:8000**
-- The Vite dev server automatically proxies `/api` requests to the backend.
+- App: <http://localhost:5173>
+- API docs: <http://localhost:8000/api/docs>
 
 ---
 
-## AI Models Used
+## Deploying as a live website
 
-| Feature            | Model                          | Library              |
-|--------------------|--------------------------------|----------------------|
-| Speech-to-Text     | `openai/whisper-base`          | `openai-whisper`     |
-| Summarization      | `facebook/bart-large-cnn`      | `transformers`       |
-| Keyword Extraction | `all-MiniLM-L6-v2` (KeyBERT)  | `keybert`            |
-| Topic Segmentation | `all-MiniLM-L6-v2`             | `sentence-transformers` |
-| Quiz & Flashcards  | `google/flan-t5-base`          | `transformers`       |
-| WER Metric         | --                             | `jiwer`              |
-| ROUGE Metric       | --                             | `rouge-score`        |
-| PDF Export         | --                             | `reportlab`          |
+The `Dockerfile` builds the frontend and serves it from the API, so the whole site is **one service on one URL**.
 
----
+### Option A — Render (free, easiest)
 
-## Application Flow
+1. Get a free API key at <https://console.groq.com/keys>.
+2. Push this repository to GitHub.
+3. On [Render](https://dashboard.render.com): **New → Blueprint** → pick this repository. `render.yaml` sets everything up.
+4. Paste your `GROQ_API_KEY` when prompted, then deploy. Your site is live at `https://intellilecture-xxxx.onrender.com`.
 
-```
-Upload MP3/WAV
-     |
-     v
-1. ASR (Whisper)       -> Full Transcript + Timestamps
-     |
-     v
-2. NLP Cleaning        -> Remove filler words
-     |
-     v
-3. Keyword Extraction  -> Top 10 keyphrases (KeyBERT)
-     |
-     v
-4. Topic Segmentation  -> Semantic sections (SentenceTransformers)
-     |
-     v
-5. Summarization       -> Overview + Key Points + Concepts (BART CNN)
-     |
-     v
-6. Quiz Generation     -> 5 MCQs + 3 Short Answers + 5 Flashcards (Flan-T5)
-     |
-     v
-7. Metrics             -> WER + ROUGE-1 + ROUGE-L (jiwer + rouge-score)
-     |
-     v
-Dashboard (6 tabs) + PDF Download
+> Free Render instances sleep after 15 minutes of inactivity (the first request after that takes ~30 s) and have no persistent disk. That's fine here because results are temporary anyway.
+
+### Option B — Hugging Face Spaces (free, 16 GB RAM — can also run local models)
+
+1. Create a new Space at <https://huggingface.co/new-space> and choose **Docker → Blank**.
+2. Push this repository to the Space, replacing the Space's `README.md` with [`deploy/huggingface/README.md`](deploy/huggingface/README.md) (it contains the required config header).
+3. In **Settings → Variables and secrets**, add the secret `GROQ_API_KEY`.
+   - Prefer no API key? Add the variable `AI_PROVIDER=local` and set the build argument `INSTALL_LOCAL_MODELS=true` in the Dockerfile. Processing will be much slower.
+
+### Option C — Any Docker host (Railway, Fly.io, Google Cloud Run, a VPS)
+
+```bash
+docker build -t intellilecture .
+docker run -p 8000:8000 -e GROQ_API_KEY=your_key intellilecture
 ```
 
+The container listens on `$PORT` (default `8000`), so it works on platforms that inject a port.
+Build with `--build-arg INSTALL_LOCAL_MODELS=true` to include the offline model stack.
+
+### Option D — Separate frontend (Vercel / Netlify) + API
+
+Build the frontend with `VITE_API_URL=https://your-api.example.com`, deploy `frontend/dist`, and set
+`ALLOWED_ORIGINS=https://your-frontend.example.com` on the API.
+
+### Before going public
+
+- Keep your API key in the host's secret settings, never in the repository.
+- Tune `UPLOADS_PER_HOUR` (per-IP limit), `MAX_UPLOAD_MB` and `MAX_CONCURRENT_JOBS` to protect your API quota.
+- Uploaded audio is deleted right after processing, and results expire after `JOB_TTL_HOURS` (default 48).
+
 ---
 
-## Performance Notes
+## Configuration
 
-Processing a 1-hour lecture on CPU takes approximately:
+All settings are environment variables (or a `.env` file). See [`.env.example`](.env.example).
 
-| Step         | Estimated Time |
-|--------------|----------------|
-| Whisper base | 5-15 min       |
-| BART         | 2-5 min        |
-| Flan-T5      | 1-3 min        |
-| KeyBERT      | < 30 sec       |
-
-**For production**: Processing is already handled as a FastAPI BackgroundTask. For heavier load consider adding a Celery worker queue.
+| Variable | Default | Description |
+|---|---|---|
+| `AI_PROVIDER` | `auto` | `auto`, `api` or `local` |
+| `GROQ_API_KEY` / `LLM_API_KEY` | – | API key for the hosted provider |
+| `LLM_BASE_URL` | Groq | Any OpenAI-compatible base URL |
+| `LLM_MODEL` | `llama-3.3-70b-versatile` | Chat model for notes, quiz and flashcards |
+| `TRANSCRIPTION_MODEL` | `whisper-large-v3-turbo` | Hosted speech-to-text model |
+| `WHISPER_MODEL` | `base` | Local Whisper size |
+| `MAX_UPLOAD_MB` | `100` | Upload size limit |
+| `UPLOADS_PER_HOUR` | `10` | Per-IP upload limit (`0` disables it) |
+| `MAX_CONCURRENT_JOBS` | `2` | Lectures processed in parallel |
+| `JOB_TTL_HOURS` | `48` | How long results are kept |
+| `ALLOWED_ORIGINS` | localhost | CORS origins (only needed for a separately hosted frontend) |
 
 ---
 
-## API Endpoints
+## API
 
-| Endpoint                  | Method | Description              |
-|---------------------------|--------|--------------------------|
-| `/api/upload`             | POST   | Upload audio file        |
-| `/api/status/{job_id}`    | GET    | Poll processing status   |
-| `/api/results/{job_id}`   | GET    | Get full results         |
-| `/api/export/{job_id}`    | GET    | Download PDF notes       |
+Interactive docs are served at `/api/docs`.
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/health` | GET | Health check |
+| `/api/config` | GET | Upload limits and active AI provider |
+| `/api/upload` | POST | Upload audio (`multipart/form-data`, field `audio_file`) → `job_id` |
+| `/api/status/{job_id}` | GET | Status, current step and progress (0–100) |
+| `/api/results/{job_id}` | GET | Full results |
+| `/api/export/{job_id}?format=pdf\|md` | GET | Download notes as PDF or Markdown |
+
+---
+
+## Project structure
+
+```
+├── backend/
+│   ├── main.py               # FastAPI app: API routes, rate limiting, serves frontend build
+│   ├── config.py             # Environment-based settings
+│   ├── jobs.py               # Thread-safe, atomic JSON job store with auto-cleanup
+│   ├── pipeline.py           # Orchestrates transcription → notes → metrics
+│   └── services/
+│       ├── cloud.py          # Hosted API pipeline (Whisper + LLM, map-reduce)
+│       ├── llm_client.py     # OpenAI-compatible client with rate-limit-aware retries
+│       ├── local.py          # Local model pipeline
+│       ├── asr.py            # Local Whisper
+│       ├── summarizer.py     # Local BART summarisation
+│       ├── nlp_utils.py      # Local KeyBERT keywords + topic segmentation
+│       ├── quiz_gen.py       # Local quiz & flashcards (Flan-T5 + cloze MCQs)
+│       ├── audio.py          # FFmpeg helpers (duration, compression, splitting)
+│       ├── text_utils.py     # Text cleaning + output validation
+│       ├── evaluator.py      # ROUGE / WER / compression metrics
+│       ├── pdf_export.py     # PDF export (ReportLab)
+│       └── markdown_export.py
+├── frontend/                 # React + Vite app
+├── tests/                    # Backend test suite (pytest)
+├── deploy/huggingface/       # Hugging Face Spaces config
+├── Dockerfile                # Production image (frontend + API)
+├── render.yaml               # Render blueprint
+├── requirements.txt          # Core dependencies (API mode)
+├── requirements-local.txt    # Optional local model dependencies
+└── requirements-dev.txt      # Test dependencies
+```
+
+## Running tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests use a fake AI pipeline, so they run in seconds without an API key or model downloads.

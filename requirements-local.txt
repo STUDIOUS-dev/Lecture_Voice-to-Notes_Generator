@@ -1,0 +1,11 @@
+# Optional: run all AI models locally (no API key needed, ~3-4 GB RAM, slow on CPU).
+# Install with:  pip install -r requirements.txt -r requirements-local.txt
+# Tip (CPU-only machines): install torch first from the CPU index to save ~2 GB:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+openai-whisper
+transformers>=4.40,<5
+torch
+sentence-transformers
+keybert
+jiwer
+numpy<2.0
