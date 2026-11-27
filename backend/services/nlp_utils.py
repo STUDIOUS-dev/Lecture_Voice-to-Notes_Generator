@@ -1,118 +1,81 @@
 """
-NLP Utilities — Text cleaning, keyword extraction, and topic segmentation.
+NLP Utilities (local mode) — keyword extraction and topic segmentation.
 
 Uses:
-  - Regex for filler word removal
   - KeyBERT for keyword extraction
   - SentenceTransformers + cosine similarity for topic segmentation
+
+Both share a single all-MiniLM-L6-v2 model to save memory.
 """
 
-import re
 import logging
+
+from backend.services.text_utils import clean_text, split_sentences
 
 logger = logging.getLogger(__name__)
 
-# Filler words common in spoken lectures
-FILLER_PATTERN = re.compile(
-    r'\b(uh+|um+|basically|you know|actually|like|right|okay|so|well|i mean|kind of|sort of)\b',
-    flags=re.IGNORECASE
-)
-
-# Threshold below which a new topic segment is declared
-TOPIC_SIMILARITY_THRESHOLD = 0.40
+# Similarity between neighbouring windows below which a new topic starts
+TOPIC_SIMILARITY_THRESHOLD = 0.35
+# Sentences per sliding window (smooths out noise from single short sentences)
+WINDOW = 3
+# Segments shorter than this many sentences are merged into the previous one
+MIN_SEGMENT_SENTENCES = 4
 
 
 class NLPUtils:
-    """
-    NLP helper class for cleaning, keyword extraction, and topic segmentation.
-    """
-
     def __init__(self):
-        from keybert import KeyBERT  # deferred import
-        from sentence_transformers import SentenceTransformer  # deferred import
-        logger.info("Loading KeyBERT and SentenceTransformer models...")
-        self.kw_model = KeyBERT()  # Internally uses 'paraphrase-MiniLM-L6-v2'
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        from keybert import KeyBERT  # deferred imports: only needed in local mode
+        from sentence_transformers import SentenceTransformer
+        logger.info("Loading SentenceTransformer + KeyBERT...")
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.kw_model = KeyBERT(model=self.embedder)
         logger.info("NLP models loaded.")
 
-    def clean_text(self, text: str) -> str:
-        """
-        Remove filler words and normalize whitespace.
-
-        Args:
-            text: Raw transcript text.
-
-        Returns:
-            Cleaned text string.
-        """
-        cleaned = FILLER_PATTERN.sub('', text)
-        # Collapse multiple spaces
-        cleaned = re.sub(r' {2,}', ' ', cleaned)
-        return cleaned.strip()
+    # Kept for backwards compatibility with older callers
+    clean_text = staticmethod(clean_text)
 
     def extract_keywords(self, text: str, top_n: int = 10) -> list[str]:
-        """
-        Extract the top N important keywords/keyphrases using KeyBERT.
-
-        Args:
-            text: Cleaned transcript text.
-            top_n: Number of keywords to extract.
-
-        Returns:
-            List of keyword strings.
-        """
         if not text or len(text.strip()) < 20:
             return []
-
-        logger.info(f"Extracting top {top_n} keywords...")
         keywords = self.kw_model.extract_keywords(
             text,
             keyphrase_ngram_range=(1, 2),
-            stop_words='english',
+            stop_words="english",
             top_n=top_n,
-            use_maxsum=True,
-            nr_candidates=20,
+            use_mmr=True,  # Maximal Marginal Relevance: diverse, non-redundant phrases
+            diversity=0.5,
         )
-        return [kw[0] for kw in keywords]
+        return [kw for kw, _score in keywords]
 
     def segment_by_topic(self, text: str) -> list[dict]:
         """
-        Segment the lecture transcript into topically coherent sections
-        using embedding cosine-similarity between consecutive sentences.
-
-        Args:
-            text: Cleaned transcript text.
-
-        Returns:
-            List of dicts: [{"title": "Topic N", "content": "..."}]
+        Split the transcript into topically coherent sections by comparing
+        embeddings of neighbouring sentence windows. All sentences are
+        encoded in a single batch (previously each sentence was encoded twice,
+        one call at a time).
         """
-        sentences = [s.strip() for s in text.split('. ') if s.strip()]
-        if not sentences:
-            return [{"title": "Topic 1", "content": text}]
+        sentences = split_sentences(text)
+        if len(sentences) <= MIN_SEGMENT_SENTENCES:
+            return [{"title": "Topic 1", "content": text, "start": None}] if text else []
 
-        logger.info(f"Segmenting {len(sentences)} sentences by topic...")
+        from sentence_transformers import util as st_util
+
+        embeddings = self.embedder.encode(sentences, convert_to_tensor=True, batch_size=64)
+        boundaries = [0]
+        for i in range(WINDOW, len(sentences) - WINDOW + 1):
+            before = embeddings[i - WINDOW:i].mean(dim=0)
+            after = embeddings[i:i + WINDOW].mean(dim=0)
+            if (float(st_util.cos_sim(before, after)) < TOPIC_SIMILARITY_THRESHOLD
+                    and i - boundaries[-1] >= MIN_SEGMENT_SENTENCES):
+                boundaries.append(i)
+        boundaries.append(len(sentences))
 
         segments = []
-        current_segment = [sentences[0]]
+        for n, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1):
+            content = " ".join(sentences[start:end])
+            title_kw = self.extract_keywords(content, top_n=1)
+            title = title_kw[0].title() if title_kw else f"Topic {n}"
+            segments.append({"title": title, "content": content, "start": None})
 
-        for i in range(1, len(sentences)):
-            emb_prev = self.embedder.encode(sentences[i - 1], convert_to_tensor=True)
-            emb_curr = self.embedder.encode(sentences[i], convert_to_tensor=True)
-            from sentence_transformers import util as st_util
-            similarity = float(st_util.cos_sim(emb_prev, emb_curr))
-
-            if similarity < TOPIC_SIMILARITY_THRESHOLD:
-                # Topic shift detected — close current segment
-                segments.append(" ".join(current_segment))
-                current_segment = [sentences[i]]
-            else:
-                current_segment.append(sentences[i])
-
-        # Append the last segment
-        segments.append(" ".join(current_segment))
-
-        logger.info(f"Found {len(segments)} topic segments.")
-        return [
-            {"title": f"Topic {i + 1}", "content": seg}
-            for i, seg in enumerate(segments)
-        ]
+        logger.info("Found %d topic segments.", len(segments))
+        return segments

@@ -1,228 +1,262 @@
-import os
-import io
-import json
-import uuid
+"""
+IntelliLecture API.
+
+Serves the REST API under /api and, in production, the built React app
+(frontend/dist) from the same origin, so the whole site deploys as a single
+service.
+"""
+
 import logging
-from typing import Dict, Any
+import re
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse, Response, FileResponse
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
-# Point to the local ffmpeg.exe bundled in the project root
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_FFMPEG_PATH = os.path.join(_PROJECT_ROOT, "ffmpeg.exe")
-if os.path.isfile(_FFMPEG_PATH):
-    os.environ["PATH"] = _PROJECT_ROOT + os.pathsep + os.environ["PATH"]
+from backend.config import settings
+from backend.jobs import JobStore, utc_now_iso
+from backend.pipeline import process_lecture
 
-from backend.services.asr import ASRService
-from backend.services.nlp_utils import NLPUtils
-from backend.services.summarizer import SummarizerService
-from backend.services.quiz_gen import QuizService
-from backend.services.evaluator import EvaluatorService
-from backend.services.pdf_export import PDFExportService
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logger = logging.getLogger("intellilecture")
 
-app = FastAPI(title="IntelliLecture API")
+store = JobStore(settings.data_dir)
+executor: ThreadPoolExecutor | None = None
+_stop_cleanup = threading.Event()
 
-# Allow CORS for React frontend (Vite default is 5173)
+
+def _cleanup_loop() -> None:
+    while not _stop_cleanup.wait(3600):
+        try:
+            store.cleanup(settings.job_ttl_hours)
+        except Exception:  # noqa: BLE001
+            logger.exception("Cleanup failed")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global executor
+    executor = ThreadPoolExecutor(max_workers=max(1, settings.max_concurrent_jobs),
+                                  thread_name_prefix="lecture")
+    _stop_cleanup.clear()
+    store.mark_interrupted()
+    store.cleanup(settings.job_ttl_hours)
+    threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
+    logger.info("AI provider: %s", settings.provider_name)
+    if settings.ai_provider == "api" and not settings.api_key:
+        logger.error("AI_PROVIDER=api but no GROQ_API_KEY / LLM_API_KEY is set")
+    yield
+    _stop_cleanup.set()
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+app = FastAPI(title="IntelliLecture API", version="2.0.0", lifespan=lifespan,
+              docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None)
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=settings.allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-JOBS_DIR = os.path.join(DATA_DIR, "jobs")
-UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
-for d in [JOBS_DIR, UPLOADS_DIR]:
-    os.makedirs(d, exist_ok=True)
 
-# ── Lazy-loaded service singletons ──────────────────────────────────────────
-_asr_service = None
-_summarizer_service = None
-_nlp_utils = None
-_quiz_service = None
-_evaluator_service = None
-_pdf_service = None
+# ── Simple in-memory rate limiter (per client IP) ────────────────────────────
+_upload_log: dict[str, deque] = defaultdict(deque)
+_rate_lock = threading.Lock()
 
-def get_asr():
-    global _asr_service
-    if _asr_service is None:
-        _asr_service = ASRService(model_size="base")
-    return _asr_service
 
-def get_summarizer():
-    global _summarizer_service
-    if _summarizer_service is None:
-        _summarizer_service = SummarizerService()
-    return _summarizer_service
+def _check_rate_limit(ip: str) -> None:
+    limit = settings.uploads_per_hour
+    if limit <= 0:
+        return
+    now = time.time()
+    with _rate_lock:
+        history = _upload_log[ip]
+        while history and now - history[0] > 3600:
+            history.popleft()
+        if len(history) >= limit:
+            retry = int(3600 - (now - history[0])) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Upload limit reached ({limit} per hour). Try again in {retry // 60 + 1} minutes.",
+                headers={"Retry-After": str(retry)},
+            )
+        history.append(now)
 
-def get_nlp():
-    global _nlp_utils
-    if _nlp_utils is None:
-        _nlp_utils = NLPUtils()
-    return _nlp_utils
 
-def get_quiz():
-    global _quiz_service
-    if _quiz_service is None:
-        _quiz_service = QuizService()
-    return _quiz_service
-
-def get_evaluator():
-    global _evaluator_service
-    if _evaluator_service is None:
-        _evaluator_service = EvaluatorService()
-    return _evaluator_service
-
-def get_pdf():
-    global _pdf_service
-    if _pdf_service is None:
-        _pdf_service = PDFExportService()
-    return _pdf_service
-
-def load_job(job_id: str) -> Dict[str, Any]:
-    path = os.path.join(JOBS_DIR, f"{job_id}.json")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Job not found")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_job(job_id: str, data: Dict[str, Any]):
-    path = os.path.join(JOBS_DIR, f"{job_id}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-def process_lecture(job_id: str, file_path: str, filename: str):
-    job = load_job(job_id)
-    job["status"] = "processing"
-    job["step"] = "Transcribing audio"
-    save_job(job_id, job)
-
-    try:
-        # Step 1: Transcription
-        logger.info(f"[{job_id}] Step 1: ASR")
-        asr_result = get_asr().transcribe(file_path)
-        job["transcript"] = asr_result
-        raw_text = asr_result["text"]
-        save_job(job_id, job)
-
-        # Step 2: Text Cleaning
-        logger.info(f"[{job_id}] Step 2: NLP cleaning")
-        job["step"] = "Cleaning text"
-        save_job(job_id, job)
-        nlp = get_nlp()
-        cleaned = nlp.clean_text(raw_text)
-        job["cleaned_text"] = cleaned
-
-        # Step 3: Keywords
-        logger.info(f"[{job_id}] Step 3: Keywords")
-        job["step"] = "Extracting keywords"
-        save_job(job_id, job)
-        job["keywords"] = nlp.extract_keywords(cleaned, top_n=10)
-
-        # Step 4: Segmentation
-        logger.info(f"[{job_id}] Step 4: Segmentation")
-        job["step"] = "Segmenting topics"
-        save_job(job_id, job)
-        job["segments"] = nlp.segment_by_topic(cleaned)
-
-        # Step 5: Summarization
-        logger.info(f"[{job_id}] Step 5: Summarization")
-        job["step"] = "Generating summary"
-        save_job(job_id, job)
-        summary = get_summarizer().summarize(cleaned)
-        job["summary"] = summary
-
-        # Step 6: Quiz and Flashcards
-        logger.info(f"[{job_id}] Step 6: Quiz + Flashcards")
-        job["step"] = "Generating quiz and flashcards"
-        save_job(job_id, job)
-        quiz_svc = get_quiz()
-        job["quiz"] = quiz_svc.generate_quiz(cleaned)
-        job["flashcards"] = quiz_svc.generate_flashcards(cleaned)
-
-        # Step 7: Metrics
-        logger.info(f"[{job_id}] Step 7: Metrics")
-        job["step"] = "Calculating metrics"
-        save_job(job_id, job)
-        summary_text = " ".join(summary.get("key_points", []))
-        job["metrics"] = get_evaluator().calculate_metrics(
-            transcript=cleaned,
-            summary=summary_text,
-        )
-
-        job["status"] = "done"
-        job["step"] = "Complete"
-        save_job(job_id, job)
-        logger.info(f"[{job_id}] Processing complete")
-
-    except Exception as e:
-        import traceback
-        full_trace = traceback.format_exc()
-        logger.error(f"[{job_id}] Pipeline error: {e}\n{full_trace}")
-        job["status"] = "error"
-        job["error"] = str(e) + "\n\n" + full_trace
-        save_job(job_id, job)
-
-@app.post("/api/upload")
-async def upload_audio(background_tasks: BackgroundTasks, audio_file: UploadFile = File(...)):
-    if not audio_file.filename:
-        raise HTTPException(status_code=400, detail="Filename not provided")
-    
-    # Save file
-    job_id = str(uuid.uuid4())
-    ext = os.path.splitext(audio_file.filename)[1]
-    file_path = os.path.join(UPLOADS_DIR, f"{job_id}{ext}")
-    
-    content = await audio_file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
-        
-    job_data = {
-        "id": job_id,
-        "filename": audio_file.filename,
-        "status": "pending",
-        "step": "Queued",
-        "error": None
-    }
-    save_job(job_id, job_data)
-    
-    # Trigger background processing
-    background_tasks.add_task(process_lecture, job_id, file_path, audio_file.filename)
-    
-    return {"job_id": job_id, "status": "pending"}
-
-@app.get("/api/status/{job_id}")
-async def get_status(job_id: str):
-    job = load_job(job_id)
-    return {"status": job.get("status"), "step": job.get("step"), "error": job.get("error")}
-
-@app.get("/api/results/{job_id}")
-async def get_results(job_id: str):
-    job = load_job(job_id)
-    if job.get("status") != "done":
-        raise HTTPException(status_code=400, detail="Job not yet complete")
+def _load_job(job_id: str) -> dict:
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found. It may have expired.")
     return job
 
-@app.get("/api/export/{job_id}")
-async def export_pdf(job_id: str):
-    job = load_job(job_id)
+
+def _require_done(job_id: str) -> dict:
+    job = _load_job(job_id)
     if job.get("status") != "done":
-        raise HTTPException(status_code=400, detail="Job not yet complete")
-        
-    pdf_bytes = get_pdf().generate(job)
-    filename = job.get("filename", "lecture").rsplit(".", 1)[0] + "_notes.pdf"
-    
+        raise HTTPException(status_code=409, detail="Job is not complete yet.")
+    return job
+
+
+def _download_headers(original_name: str, suffix: str) -> dict:
+    stem = Path(original_name or "lecture").stem or "lecture"
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "lecture"
+    return {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_name}{suffix}"; '
+            f"filename*=UTF-8''{quote(stem + suffix)}"
+        )
+    }
+
+
+# ── API routes ───────────────────────────────────────────────────────────────
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "provider": settings.provider_name}
+
+
+@app.get("/api/config")
+def get_config():
+    return {
+        "provider": settings.provider_name,
+        "max_upload_mb": settings.max_upload_mb,
+        "allowed_extensions": list(settings.allowed_extensions),
+    }
+
+
+@app.post("/api/upload", status_code=202)
+async def upload_audio(request: Request, audio_file: UploadFile = File(...)):
+    filename = (audio_file.filename or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="No file was provided.")
+    ext = Path(filename).suffix.lower()
+    if ext not in settings.allowed_extensions:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext or 'none'}'. "
+                   f"Allowed: {', '.join(settings.allowed_extensions)}",
+        )
+
+    _check_rate_limit(request.client.host if request.client else "unknown")
+
+    job_id = uuid.uuid4().hex
+    file_path = store.uploads_dir / f"{job_id}{ext}"
+    size = 0
+    try:
+        with open(file_path, "wb") as out:
+            while chunk := await audio_file.read(1024 * 1024):
+                size += len(chunk)
+                if size > settings.max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File is too large. The maximum size is {settings.max_upload_mb} MB.",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        file_path.unlink(missing_ok=True)
+        raise
+    if size == 0:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    now = utc_now_iso()
+    store.save({
+        "id": job_id,
+        "filename": Path(filename).name[:200],
+        "status": "queued",
+        "step": "Waiting in queue",
+        "progress": 0,
+        "error": None,
+        "provider": settings.provider_name,
+        "created_at": now,
+        "updated_at": now,
+    })
+    if executor is None:
+        raise HTTPException(status_code=503, detail="Server is starting up. Please retry.")
+    executor.submit(process_lecture, job_id, file_path, store, settings)
+    logger.info("Queued job %s (%s, %.1f MB)", job_id, filename, size / 1e6)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/status/{job_id}")
+def get_status(job_id: str):
+    job = _load_job(job_id)
+    return {
+        "status": job.get("status"),
+        "step": job.get("step"),
+        "progress": job.get("progress", 0),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/api/results/{job_id}")
+def get_results(job_id: str):
+    return _require_done(job_id)
+
+
+@app.get("/api/export/{job_id}")
+def export_notes(job_id: str, format: str = Query("pdf", pattern="^(pdf|md)$")):
+    job = _require_done(job_id)
+    if format == "md":
+        from backend.services.markdown_export import generate_markdown
+        return Response(
+            content=generate_markdown(job),
+            media_type="text/markdown; charset=utf-8",
+            headers=_download_headers(job.get("filename"), "_notes.md"),
+        )
+    from backend.services.pdf_export import PDFExportService
     return Response(
-        content=pdf_bytes,
+        content=PDFExportService().generate(job),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers=_download_headers(job.get("filename"), "_notes.pdf"),
     )
+
+
+@app.api_route("/api/{_path:path}", methods=["GET", "POST"], include_in_schema=False)
+def api_not_found(_path: str):
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+# ── Frontend (production build) ─────────────────────────────────────────────
+_dist = settings.frontend_dist
+if (_dist / "index.html").is_file():
+    if (_dist / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=_dist / "assets"), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str):
+        candidate = (_dist / full_path).resolve()
+        if full_path and candidate.is_file() and _dist in candidate.parents:
+            return FileResponse(candidate)
+        return FileResponse(_dist / "index.html", headers={"Cache-Control": "no-cache"})
+else:
+    @app.get("/", include_in_schema=False)
+    def root():
+        return {
+            "message": "IntelliLecture API is running. Build the frontend "
+                       "(cd frontend && npm run build) to serve the web app here.",
+            "docs": "/api/docs",
+        }

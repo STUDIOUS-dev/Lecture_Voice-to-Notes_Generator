@@ -1,96 +1,71 @@
 """
-Summarizer Service — Text summarization using facebook/bart-large-cnn.
+Summarizer Service (local mode) — facebook/bart-large-cnn.
 
-Handles long texts by chunking them intelligently before passing
-to the transformer pipeline, then stitching the summaries together
-into a structured output.
+Long transcripts are split on sentence boundaries into chunks that fit the
+model's 1024-token window, summarised, then stitched into a structured result.
 """
 
 import logging
 
+from backend.services.text_utils import split_sentences
+
 logger = logging.getLogger(__name__)
 
-# Max characters per chunk for BART (approx 1024 tokens ≈ 800 chars)
-MAX_CHUNK_CHARS = 800
+# ~1024 BART tokens ≈ 3,500 characters of English; leave headroom
+MAX_CHUNK_CHARS = 3000
 
 
 class SummarizerService:
-    """
-    Summarization using facebook/bart-large-cnn (pretrained, no fine-tuning needed).
-    """
-
     def __init__(self, model_name: str = "facebook/bart-large-cnn"):
-        from transformers import pipeline  # deferred import
-        logger.info(f"Loading summarization model: {model_name}")
-        self.summarizer = pipeline(
-            "summarization",
-            model=model_name,
-        )
+        from transformers import pipeline  # deferred import: only needed in local mode
+        logger.info("Loading summarization model: %s", model_name)
+        self.summarizer = pipeline("summarization", model=model_name)
         logger.info("Summarization model loaded.")
 
-    def _chunk_text(self, text: str) -> list[str]:
-        """Split text into chunks that fit within the model's token limit."""
-        words = text.split()
-        chunks = []
-        current_chunk = []
-        current_len = 0
-
-        for word in words:
-            current_chunk.append(word)
-            current_len += len(word) + 1
-            if current_len >= MAX_CHUNK_CHARS:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                current_len = 0
-
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-
+    @staticmethod
+    def _chunk_text(text: str) -> list[str]:
+        chunks, current, size = [], [], 0
+        for sentence in split_sentences(text):
+            if current and size + len(sentence) > MAX_CHUNK_CHARS:
+                chunks.append(" ".join(current))
+                current, size = [], 0
+            current.append(sentence)
+            size += len(sentence) + 1
+        if current:
+            chunks.append(" ".join(current))
         return chunks
 
     def summarize(self, text: str) -> dict:
-        """
-        Summarize the lecture transcript.
-
-        Returns a structured dict:
-            - overview (str): High-level 2-3 sentence summary.
-            - key_points (list[str]): Bullet-level important sentences.
-            - important_concepts (list[str]): Shorter conceptual phrases.
-        """
         if not text or len(text.strip()) < 50:
             return {
-                "overview": "Text too short to summarize.",
+                "overview": "The transcript is too short to summarise.",
                 "key_points": [],
                 "important_concepts": [],
             }
 
-        logger.info("Starting summarization...")
         chunks = self._chunk_text(text)
-        logger.info(f"Text split into {len(chunks)} chunks.")
-
-        summaries = self.summarizer(
-            chunks,
-            max_length=150,
-            min_length=40,
-            do_sample=False,
-            truncation=True,
+        logger.info("Summarising %d chunks...", len(chunks))
+        outputs = self.summarizer(
+            chunks, max_length=150, min_length=30, do_sample=False, truncation=True,
         )
+        chunk_summaries = [o["summary_text"].strip() for o in outputs]
 
-        # Stitch chunked summaries into one body
-        full_summary = " ".join(s["summary_text"] for s in summaries)
+        sentences: list[str] = []
+        for s in split_sentences(" ".join(chunk_summaries)):
+            if s not in sentences:
+                sentences.append(s)
 
-        # Parse into structure
-        sentences = [s.strip() for s in full_summary.split(".") if s.strip()]
+        # For long lectures, summarise the summaries to get a coherent overview
+        if len(chunk_summaries) > 2:
+            combined = " ".join(chunk_summaries)[: MAX_CHUNK_CHARS]
+            overview = self.summarizer(
+                combined, max_length=120, min_length=40, do_sample=False, truncation=True,
+            )[0]["summary_text"].strip()
+        else:
+            overview = " ".join(sentences[:3])
 
-        overview = ". ".join(sentences[:3]) + "." if sentences else full_summary
-        key_points = sentences  # All sentences as bullet points
-        important_concepts = [
-            s for s in sentences if len(s.split()) <= 8
-        ]  # Short phrases = concepts
-
-        logger.info("Summarization complete.")
         return {
             "overview": overview,
-            "key_points": key_points,
-            "important_concepts": important_concepts,
+            "key_points": sentences,
+            "important_concepts": [s for s in sentences if len(s.split()) <= 12],
         }

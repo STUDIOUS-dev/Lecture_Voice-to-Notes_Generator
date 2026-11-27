@@ -12,8 +12,23 @@ Uses ReportLab to produce a clean, multi-section PDF with:
 
 import io
 import logging
+from xml.sax.saxutils import escape
 
 logger = logging.getLogger(__name__)
+
+
+def _esc(value) -> str:
+    """Escape text for ReportLab's mini-HTML markup (&, <, > would break it)."""
+    return escape(str(value if value is not None else ""))
+
+
+def _ts(seconds) -> str:
+    if seconds is None:
+        return ""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _get_reportlab():
@@ -131,83 +146,97 @@ class PDFExportService:
             story.append(Spacer(1, 6))
 
         # ── Title ──────────────────────────────────────────
-        story.append(Paragraph("📚 IntelliLecture — Lecture Notes", styles["DocTitle"]))
+        story.append(Paragraph("IntelliLecture - Lecture Notes", styles["DocTitle"]))
         story.append(Paragraph(
-            f"File: <b>{lecture_data.get('filename', 'lecture')}</b>",
+            f"File: <b>{_esc(lecture_data.get('filename', 'lecture'))}</b>",
             styles["BodyText2"]
         ))
         hr()
 
         # ── Summary ────────────────────────────────────────
-        summary = lecture_data.get("summary", {})
+        summary = lecture_data.get("summary") or {}
         story.append(Paragraph("1. Summary", styles["SectionHeader"]))
 
         story.append(Paragraph("Overview", styles["SubHeader"]))
-        story.append(Paragraph(summary.get("overview", "—"), styles["BodyText2"]))
+        story.append(Paragraph(_esc(summary.get("overview") or "-"), styles["BodyText2"]))
 
         story.append(Paragraph("Key Points", styles["SubHeader"]))
-        for point in summary.get("key_points", []):
-            story.append(Paragraph(f"• {point}", styles["Bullet2"]))
+        for point in summary.get("key_points") or []:
+            story.append(Paragraph(f"&bull; {_esc(point)}", styles["Bullet2"]))
 
         story.append(Paragraph("Important Concepts", styles["SubHeader"]))
-        for concept in summary.get("important_concepts", []):
-            story.append(Paragraph(f"➤ {concept}", styles["Bullet2"]))
+        for concept in summary.get("important_concepts") or []:
+            story.append(Paragraph(f"&raquo; {_esc(concept)}", styles["Bullet2"]))
         hr()
 
         # ── Keywords ───────────────────────────────────────
-        keywords = lecture_data.get("keywords", [])
+        keywords = lecture_data.get("keywords") or []
         story.append(Paragraph("2. Keywords", styles["SectionHeader"]))
-        kw_text = "  |  ".join(keywords) if keywords else "—"
+        kw_text = _esc("  |  ".join(keywords)) if keywords else "-"
         story.append(Paragraph(kw_text, styles["BodyText2"]))
         hr()
 
         # ── Topic Segments ─────────────────────────────────
-        segments = lecture_data.get("segments", [])
+        segments = lecture_data.get("segments") or []
         if segments:
             story.append(Paragraph("3. Topic Segments", styles["SectionHeader"]))
             for seg in segments:
-                story.append(Paragraph(seg.get("title", "Topic"), styles["SubHeader"]))
-                story.append(Paragraph(seg.get("content", ""), styles["BodyText2"]))
+                stamp = f" ({_ts(seg.get('start'))})" if seg.get("start") is not None else ""
+                story.append(Paragraph(_esc(seg.get("title", "Topic")) + stamp, styles["SubHeader"]))
+                story.append(Paragraph(_esc(seg.get("content", "")), styles["BodyText2"]))
             hr()
 
         # ── Quiz ───────────────────────────────────────────
-        quiz = lecture_data.get("quiz", {})
+        quiz = lecture_data.get("quiz") or {}
         story.append(Paragraph("4. Quiz Questions", styles["SectionHeader"]))
 
         story.append(Paragraph("Multiple Choice Questions", styles["SubHeader"]))
-        mcqs = quiz.get("mcqs", [])
+        mcqs = quiz.get("mcqs") or []
         if mcqs:
             for i, mcq in enumerate(mcqs, 1):
-                q_text = mcq.get("question", "")
-                diff   = mcq.get("difficulty", "")
-                story.append(Paragraph(
-                    f"Q{i}. [{diff}] {q_text}", styles["Bullet2"]
-                ))
+                q_text = _esc(mcq.get("question", ""))
+                diff   = _esc(mcq.get("difficulty", ""))
+                story.append(Paragraph(f"<b>Q{i}.</b> [{diff}] {q_text}", styles["Bullet2"]))
+                options = mcq.get("options") or []
+                for j, opt in enumerate(options):
+                    story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;{chr(65 + j)}. {_esc(opt)}", styles["Bullet2"]))
+                idx = mcq.get("answer_index")
+                if isinstance(idx, int) and 0 <= idx < len(options):
+                    expl = mcq.get("explanation")
+                    story.append(Paragraph(
+                        f"&nbsp;&nbsp;&nbsp;<i>Answer: {chr(65 + idx)}"
+                        + (f" - {_esc(expl)}" if expl else "") + "</i>",
+                        styles["Bullet2"],
+                    ))
         else:
-            story.append(Paragraph("—", styles["BodyText2"]))
+            story.append(Paragraph("-", styles["BodyText2"]))
 
         story.append(Paragraph("Short Answer Questions", styles["SubHeader"]))
-        sas = quiz.get("short_answers", [])
+        sas = quiz.get("short_answers") or []
         if sas:
             for i, sa in enumerate(sas, 1):
                 story.append(Paragraph(
-                    f"Q{i}. [{sa.get('difficulty', '')}] {sa.get('question', '')}",
+                    f"<b>Q{i}.</b> [{_esc(sa.get('difficulty', ''))}] {_esc(sa.get('question', ''))}",
                     styles["Bullet2"]
                 ))
+                if sa.get("answer"):
+                    story.append(Paragraph(
+                        f"&nbsp;&nbsp;&nbsp;<i>Model answer: {_esc(sa['answer'])}</i>", styles["Bullet2"]
+                    ))
         else:
-            story.append(Paragraph("—", styles["BodyText2"]))
+            story.append(Paragraph("-", styles["BodyText2"]))
         hr()
 
         # ── Flashcards ─────────────────────────────────────
-        flashcards = lecture_data.get("flashcards", [])
+        flashcards = lecture_data.get("flashcards") or []
         story.append(Paragraph("5. Flashcards", styles["SectionHeader"]))
         if flashcards:
             table_data = [["#", "Question", "Answer"]]
             for i, fc in enumerate(flashcards, 1):
                 table_data.append([
                     str(i),
-                    Paragraph(fc.get("question", ""), styles["BodyText2"]),
-                    Paragraph(fc.get("answer", ""), styles["BodyText2"]),
+                    Paragraph(_esc(fc.get("question", "")), styles["BodyText2"]),
+                    Paragraph(_esc(fc.get("answer", "")), styles["BodyText2"]),
                 ])
             table = Table(table_data, colWidths=[1 * cm, 8 * cm, 8 * cm])
             table.setStyle(TableStyle([
@@ -222,27 +251,27 @@ class PDFExportService:
             ]))
             story.append(table)
         else:
-            story.append(Paragraph("—", styles["BodyText2"]))
+            story.append(Paragraph("-", styles["BodyText2"]))
         hr()
 
         # ── Evaluation Metrics ─────────────────────────────
-        metrics = lecture_data.get("metrics", {})
+        metrics = lecture_data.get("metrics") or {}
         story.append(Paragraph("6. Evaluation Metrics", styles["SectionHeader"]))
         metrics_data = [
             ["Metric", "Score", "Interpretation"],
             [
                 "ROUGE-1 F1",
-                str(metrics.get("rouge1", "—")),
+                str(metrics.get("rouge1") if metrics.get("rouge1") is not None else "N/A"),
                 "Summary content overlap (higher = better)",
             ],
             [
                 "ROUGE-L F1",
-                str(metrics.get("rougeL", "—")),
+                str(metrics.get("rougeL") if metrics.get("rougeL") is not None else "N/A"),
                 "Longest common subsequence overlap",
             ],
             [
                 "WER",
-                str(metrics.get("wer", "N/A")),
+                str(metrics.get("wer") if metrics.get("wer") is not None else "N/A"),
                 "Word Error Rate (lower = better; needs ground-truth)",
             ],
         ]
@@ -264,9 +293,11 @@ class PDFExportService:
         transcript = lecture_data.get("cleaned_text", "")
         if not transcript and isinstance(lecture_data.get("transcript"), dict):
             transcript = lecture_data["transcript"].get("text", "")
-        # Break into paragraphs of ~500 chars to avoid ReportLab overflow
-        for chunk_start in range(0, len(transcript), 500):
-            story.append(Paragraph(transcript[chunk_start:chunk_start + 500], styles["BodyText2"]))
+        # Paragraphs of a few sentences each; very long paragraphs can't split across pages
+        from backend.services.text_utils import split_sentences
+        sentences = split_sentences(transcript)
+        for start in range(0, len(sentences), 5):
+            story.append(Paragraph(_esc(" ".join(sentences[start:start + 5])), styles["BodyText2"]))
 
         doc.build(story)
         pdf_bytes = buffer.getvalue()

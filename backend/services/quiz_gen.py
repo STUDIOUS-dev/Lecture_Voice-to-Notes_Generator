@@ -1,132 +1,105 @@
 """
-Quiz & Flashcard Generation Service using google/flan-t5-base.
+Quiz & Flashcard generation (local mode) using google/flan-t5-base.
 
-Generates:
-  - 5 Multiple Choice Questions (MCQs) with difficulty tags
-  - 3 Short Answer Questions
-  - 5 Flashcard Q/A pairs
-
-As flan-t5 is a generative model, we use prompt engineering to
-structure the output; parsing is done with simple heuristics.
+Small models cannot reliably produce "5 MCQs" in one go, so the work is
+broken into steps they handle well:
+  - MCQs are built deterministically as fill-in-the-blank questions from
+    key-point sentences, with other lecture keywords as distractors, so every
+    question has real options and a known correct answer.
+  - Short-answer questions and flashcards ask Flan-T5 to write ONE question
+    per key point; the key point itself is the model answer.
 """
 
-import re
 import logging
+import random
+import re
+
+from backend.services.text_utils import split_sentences
 
 logger = logging.getLogger(__name__)
 
 DIFFICULTY_LABELS = ["Easy", "Medium", "Hard"]
 
 
-class QuizService:
-    """
-    Quiz and flashcard generation using google/flan-t5-base.
-    """
+def _difficulty(index: int) -> str:
+    return DIFFICULTY_LABELS[index % len(DIFFICULTY_LABELS)]
 
+
+def build_cloze_mcqs(sentences: list[str], keywords: list[str], count: int = 5,
+                     seed: int = 42) -> list[dict]:
+    """Create fill-in-the-blank MCQs using keywords as answers and distractors."""
+    rng = random.Random(seed)
+    mcqs: list[dict] = []
+    used: set[str] = set()
+    for sentence in sentences:
+        if len(mcqs) >= count:
+            break
+        for kw in keywords:
+            if kw.lower() in used:
+                continue
+            pattern = re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)
+            if not pattern.search(sentence):
+                continue
+            distractors = [k for k in keywords if k.lower() != kw.lower()
+                           and k.lower() not in kw.lower() and kw.lower() not in k.lower()]
+            if len(distractors) < 3:
+                continue
+            options = rng.sample(distractors, 3) + [kw]
+            rng.shuffle(options)
+            mcqs.append({
+                "question": "Fill in the blank: " + pattern.sub("_____", sentence, count=1),
+                "options": options,
+                "answer_index": options.index(kw),
+                "explanation": sentence,
+                "difficulty": _difficulty(len(mcqs)),
+            })
+            used.add(kw.lower())
+            break
+    return mcqs
+
+
+class QuizService:
     def __init__(self, model_name: str = "google/flan-t5-base"):
-        from transformers import pipeline  # deferred import
-        logger.info(f"Loading quiz generation model: {model_name}")
+        from transformers import pipeline  # deferred import: only needed in local mode
+        logger.info("Loading quiz generation model: %s", model_name)
         self.generator = pipeline("text2text-generation", model=model_name)
         logger.info("Quiz model loaded.")
 
-    def _generate(self, prompt: str, max_length: int = 256) -> str:
-        """Run a single generation call and return the text output."""
-        result = self.generator(
-            prompt,
-            max_length=max_length,
-            num_beams=4,
-            early_stopping=True,
-        )
-        return result[0]["generated_text"].strip()
+    def _question_for(self, sentence: str) -> str:
+        prompt = f"Write one exam question that is answered by this statement: {sentence}"
+        out = self.generator(prompt, max_length=64, num_beams=4, early_stopping=True)
+        question = out[0]["generated_text"].strip()
+        if not question.endswith("?"):
+            question = question.rstrip(".") + "?"
+        return question
 
-    def _assign_difficulty(self, index: int) -> str:
-        """Cycle through Easy/Medium/Hard for variety."""
-        return DIFFICULTY_LABELS[index % len(DIFFICULTY_LABELS)]
+    def _qa_pairs(self, statements: list[str], count: int) -> list[dict]:
+        pairs, seen = [], set()
+        for statement in statements:
+            if len(pairs) >= count:
+                break
+            if len(statement.split()) < 5:
+                continue
+            question = self._question_for(statement)
+            if question.lower() in seen or len(question) < 10:
+                continue
+            seen.add(question.lower())
+            pairs.append({"question": question, "answer": statement})
+        return pairs
 
-    def generate_quiz(self, text: str) -> dict:
-        """
-        Generate MCQs and Short Answer Questions from the lecture text.
+    def generate_quiz(self, text: str, key_points: list[str] | None = None,
+                      keywords: list[str] | None = None) -> dict:
+        statements = key_points or split_sentences(text)[:20]
+        mcqs = build_cloze_mcqs(statements + split_sentences(text), keywords or [])
+        short_answers = [
+            {**pair, "difficulty": _difficulty(i + 1)}
+            for i, pair in enumerate(self._qa_pairs(statements, 3))
+        ]
+        logger.info("Generated %d MCQs and %d short answers.", len(mcqs), len(short_answers))
+        return {"mcqs": mcqs, "short_answers": short_answers}
 
-        Args:
-            text: Cleaned lecture transcript (first 1200 chars used for prompting).
-
-        Returns:
-            dict with:
-                - mcqs (list[dict]): Each has 'question', 'raw_answer', 'difficulty'.
-                - short_answers (list[dict]): Each has 'question', 'difficulty'.
-        """
-        snippet = text[:1200]
-
-        # --- MCQ Generation ---
-        mcq_prompt = (
-            f"Generate 5 multiple choice questions with 4 options (A, B, C, D) "
-            f"and the correct answer labeled. Use this text:\n{snippet}"
-        )
-        mcq_raw = self._generate(mcq_prompt, max_length=512)
-        mcq_lines = [l.strip() for l in mcq_raw.split('\n') if l.strip()]
-
-        mcqs = []
-        for i, line in enumerate(mcq_lines[:5]):
-            mcqs.append({
-                "question": line,
-                "difficulty": self._assign_difficulty(i),
-            })
-
-        # --- Short Answer Generation ---
-        sa_prompt = (
-            f"Generate 3 short answer questions (one sentence each) from this text:\n{snippet}"
-        )
-        sa_raw = self._generate(sa_prompt, max_length=256)
-        sa_lines = [l.strip() for l in sa_raw.split('\n') if l.strip()]
-
-        short_answers = []
-        for i, line in enumerate(sa_lines[:3]):
-            short_answers.append({
-                "question": line,
-                "difficulty": self._assign_difficulty(i + 1),
-            })
-
-        logger.info(f"Generated {len(mcqs)} MCQs and {len(short_answers)} short answers.")
-        return {
-            "mcqs": mcqs,
-            "short_answers": short_answers,
-        }
-
-    def generate_flashcards(self, text: str) -> list[dict]:
-        """
-        Generate 5 flashcard Q/A pairs.
-
-        Args:
-            text: Cleaned lecture transcript.
-
-        Returns:
-            List of dicts: [{"question": "...", "answer": "..."}]
-        """
-        snippet = text[:1200]
-        prompt = (
-            f"Create 5 flashcards in the format 'Q: ... A: ...' "
-            f"from this text:\n{snippet}"
-        )
-        raw = self._generate(prompt, max_length=512)
-
-        # Parse "Q: ... A: ..." pairs
-        flashcards = []
-        # Try to match Q: ... A: ... pattern
-        pattern = re.findall(r'Q[:\.]?\s*(.+?)\s*A[:\.]?\s*(.+?)(?=Q[:\.]?|$)', raw, re.DOTALL | re.IGNORECASE)
-
-        if pattern:
-            for q, a in pattern[:5]:
-                flashcards.append({"question": q.strip(), "answer": a.strip()})
-        else:
-            # Fallback: split by newlines and pair them
-            lines = [l.strip() for l in raw.split('\n') if l.strip()]
-            for i in range(0, min(len(lines) - 1, 10), 2):
-                flashcards.append({
-                    "question": lines[i],
-                    "answer": lines[i + 1] if i + 1 < len(lines) else "—",
-                })
-                if len(flashcards) >= 5:
-                    break
-
-        logger.info(f"Generated {len(flashcards)} flashcards.")
-        return flashcards
+    def generate_flashcards(self, text: str, key_points: list[str] | None = None) -> list[dict]:
+        statements = list(reversed(key_points or split_sentences(text)[:20]))
+        cards = self._qa_pairs(statements, 6)
+        logger.info("Generated %d flashcards.", len(cards))
+        return cards

@@ -1,16 +1,53 @@
-# React + Vite
+# IntelliLecture — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite single-page app for IntelliLecture: upload a lecture recording and browse the
+generated transcript, summary, keywords and topics, quiz, flashcards and quality metrics, with
+PDF / Markdown export.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+```bash
+npm install
+npm run dev:frontend   # Vite dev server on http://localhost:5173
+```
 
-## React Compiler
+In development, requests to `/api` are proxied to the backend at `http://127.0.0.1:8000`
+(see `vite.config.js`).
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+To start the backend and frontend together (requires the Python virtual environment to be
+activated in the same shell):
 
-## Expanding the ESLint configuration
+```bash
+npm run dev
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Build
+
+```bash
+npm run lint
+npm run build     # outputs static files to dist/
+npm run preview   # serve the production build locally
+```
+
+## Configuration
+
+| Variable       | Default        | Purpose                                                                 |
+| -------------- | -------------- | ----------------------------------------------------------------------- |
+| `VITE_API_URL` | _(empty)_      | Backend origin when the frontend is hosted separately, e.g. `https://api.example.com`. `/api` is appended automatically. Leave empty to use same-origin `/api`. |
+
+Set it at build time, e.g. `VITE_API_URL=https://api.example.com npm run build`, or in a
+`.env.local` file.
+
+## Structure
+
+```
+src/
+  api.js                 API client (config, upload, status, results, export URLs)
+  utils.js               formatting + URL (?job=) helpers
+  hooks/useJobPolling.js status polling with retry on network blips
+  components/            upload, processing, error, dashboard views
+  components/tabs/       transcript, summary, keywords, quiz, flashcards, metrics
+```
+
+A job id is kept in the URL (`?job=<id>`), so refreshing or sharing the page resumes the job
+or reopens its results.
