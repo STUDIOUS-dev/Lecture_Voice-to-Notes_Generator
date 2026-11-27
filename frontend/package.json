@@ -1,12 +1,12 @@
 {
-  "name": "frontend",
+  "name": "intellilecture-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:frontend": "vite",
-    "dev:backend": "cd .. && venv\\Scripts\\python -m uvicorn backend.main:app --reload",
+    "dev:backend": "cd .. && python -m uvicorn backend.main:app --reload --port 8000",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
