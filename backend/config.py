@@ -58,7 +58,7 @@ class Settings:
     api_base_url: str = field(
         default_factory=lambda: _env("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
     )
-    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "llama-3.3-70b-versatile"))
+    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "openai/gpt-oss-120b"))
     transcription_model: str = field(
         default_factory=lambda: _env("TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
     )

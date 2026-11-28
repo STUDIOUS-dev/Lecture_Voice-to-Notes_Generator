@@ -62,3 +62,17 @@ def test_retry_after_parsing():
     assert _parse_retry_after(r) == 62.5
     r = httpx.Response(429, headers={"retry-after": "3"})
     assert _parse_retry_after(r) == 3.0
+
+
+def test_retired_model_gives_actionable_error():
+    import pytest
+    from backend.services.llm_client import APIError, LLMClient
+
+    def handler(request):
+        return httpx.Response(404, json={"error": {"message": "The model `old` does not exist",
+                                                   "code": "model_not_found"}})
+
+    client = LLMClient("https://example.test/v1", "key", max_retries=0)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(APIError, match="'old' is not available"):
+        client.chat_json("old", "s", "u")

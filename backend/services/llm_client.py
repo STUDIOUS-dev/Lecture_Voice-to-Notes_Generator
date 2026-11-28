@@ -64,6 +64,13 @@ class LLMClient:
                     return response
                 if response.status_code in (401, 403):
                     raise APIError("The AI service rejected the API key. Check GROQ_API_KEY.")
+                if response.status_code == 404 and "model" in response.text.lower():
+                    logger.error("Model not found: %s", response.text[:500])
+                    model = (kwargs.get("json") or kwargs.get("data") or {}).get("model", "")
+                    raise APIError(
+                        f"The AI model '{model}' is not available from the provider. "
+                        "Set LLM_MODEL (or TRANSCRIPTION_MODEL) to a current model."
+                    )
                 if response.status_code not in RETRYABLE_STATUS or attempt == self.max_retries:
                     logger.error("API error %s: %s", response.status_code, response.text[:1000])
                     raise APIError(

@@ -24,10 +24,11 @@ The AI backend is **switchable** via the `AI_PROVIDER` setting:
 
 | Mode | Speech-to-text | Notes, quiz & flashcards | Speed (1-hr lecture) | Needs |
 |---|---|---|---|---|
-| **API** (recommended) | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | ~1–3 min | Free [Groq API key](https://console.groq.com/keys) |
+| **API** (recommended) | `whisper-large-v3-turbo` | `openai/gpt-oss-120b` | ~1–3 min | Free [Groq API key](https://console.groq.com/keys) |
 | **Local** | Whisper `base` | BART-large-CNN, KeyBERT, Flan-T5 | 10–25 min on CPU | ~4 GB RAM, `requirements-local.txt` |
 
 `AI_PROVIDER=auto` (default) uses the API when a key is set and falls back to local models otherwise.
+Providers retire models from time to time; if processing fails with a "model is not available" error, set `LLM_MODEL` to a current model from your provider's model list.
 Any OpenAI-compatible API works (OpenAI, Together, a local Ollama, …) via `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`.
 
 Long lectures are handled map-reduce style: the transcript is split into timestamped chunks, each chunk is turned into topic sections, and a final pass produces the summary, quiz and flashcards. This keeps every request within free-tier limits, and rate-limit responses are retried automatically.
@@ -113,7 +114,7 @@ All settings are environment variables (or a `.env` file). See [`.env.example`](
 | `AI_PROVIDER` | `auto` | `auto`, `api` or `local` |
 | `GROQ_API_KEY` / `LLM_API_KEY` | – | API key for the hosted provider |
 | `LLM_BASE_URL` | Groq | Any OpenAI-compatible base URL |
-| `LLM_MODEL` | `llama-3.3-70b-versatile` | Chat model for notes, quiz and flashcards |
+| `LLM_MODEL` | `openai/gpt-oss-120b` | Chat model for notes, quiz and flashcards |
 | `TRANSCRIPTION_MODEL` | `whisper-large-v3-turbo` | Hosted speech-to-text model |
 | `WHISPER_MODEL` | `base` | Local Whisper size |
 | `MAX_UPLOAD_MB` | `100` | Upload size limit |
