@@ -2,6 +2,8 @@
 Lightweight text helpers shared by both pipelines (no ML dependencies).
 """
 
+import hashlib
+import random
 import re
 from typing import Any
 
@@ -121,6 +123,13 @@ def normalize_mcqs(data: Any) -> list[dict[str, Any]]:
                 answer_index = idx if idx < len(options) else None
             elif answer in options:
                 answer_index = options.index(answer)
+        if answer_index is not None and len(options) > 1:
+            # LLMs tend to put the right answer in the same slot every time;
+            # move it to a position derived from the question (stable across reloads).
+            seed = int(hashlib.sha256(question.encode()).hexdigest()[:8], 16)
+            target = random.Random(seed).randrange(len(options))
+            options[answer_index], options[target] = options[target], options[answer_index]
+            answer_index = target
         mcqs.append({
             "question": question,
             "options": options,

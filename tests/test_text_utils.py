@@ -28,7 +28,7 @@ def test_normalize_mcqs_handles_letters_and_bad_data():
         "garbage",
     ])
     assert len(mcqs) == 2
-    assert mcqs[0]["answer_index"] == 2
+    assert mcqs[0]["options"][mcqs[0]["answer_index"]] == "c"  # letter "C" resolved, survives shuffle
     assert mcqs[1]["answer_index"] is None
     assert mcqs[1]["difficulty"] == "Hard"
 
@@ -56,3 +56,14 @@ def test_cloze_mcqs_have_valid_answers():
         assert len(q["options"]) == 4
         assert len(set(o.lower() for o in q["options"])) == 4
         assert 0 <= q["answer_index"] < 4
+
+
+def test_mcq_answer_positions_are_shuffled_but_stable():
+    raw = [{"question": f"Question number {i}?", "options": ["right", "w1", "w2", "w3"], "answer_index": 0}
+           for i in range(12)]
+    mcqs = normalize_mcqs(raw)
+    for q in mcqs:
+        assert q["options"][q["answer_index"]] == "right"
+        assert sorted(q["options"]) == ["right", "w1", "w2", "w3"]
+    assert len({q["answer_index"] for q in mcqs}) > 1  # not all in the same slot
+    assert normalize_mcqs(raw) == mcqs  # deterministic
